@@ -1,0 +1,10 @@
+torch>=2.1.0
+torchvision
+torchaudio
+transformers==4.43.3
+sentence-transformers==3.0.1
+accelerate>=0.33.0
+langdetect==1.0.9
+numpy>=1.26.0
+pandas>=2.1.0
+streamlit==1.37.0
