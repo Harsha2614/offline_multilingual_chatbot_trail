@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import whisper
-import tempfile
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 from sentence_transformers import SentenceTransformer
@@ -62,11 +61,6 @@ def safe_detect(text: str) -> str:
         return "en"
     if len(t) < 5:
         return "en"
-    lower = t.lower()
-    eng_markers = [" how ", " what ", " why ", " when ", " where ", " who ",
-                   " do ", " does ", " is ", " are ", " can "]
-    if any(m in (" " + lower + " ") for m in eng_markers):
-        return "en"
     detected = detect_lang(text)
     if detected not in LANG_CODE_MAP:
         return "en"
@@ -110,27 +104,21 @@ def cosine_search(embedder, kb_embeddings, df, query: str, k: int = 3):
 
 def transcribe_audio_bytes(audio_bytes: bytes) -> str:
     """Convert mic audio to English text using Whisper (without ffmpeg)."""
-    import numpy as np
     import soundfile as sf
     import librosa
 
-    # Decode mic recording into numpy
     data, samplerate = sf.read(io.BytesIO(audio_bytes), dtype="float32")
-
-    # Ensure mono and 16kHz for Whisper
     if data.ndim > 1:
         data = np.mean(data, axis=1)
     if samplerate != 16000:
         data = librosa.resample(data, orig_sr=samplerate, target_sr=16000)
 
-    # Run Whisper directly on numpy array
     whisper_model = load_whisper()
     result = whisper_model.transcribe(data, fp16=False, language="en")
 
     raw_text = result.get("text", "").strip()
-    english_text = translate(raw_text, "en")   # force translation to English
+    english_text = translate(raw_text, "en")  # force English
     return english_text
-
 
 def rebuild_kb():
     os.makedirs(ART_DIR, exist_ok=True)
@@ -146,9 +134,57 @@ def rebuild_kb():
 
 # ---------------- Main app ----------------
 def main():
-    st.set_page_config(page_title="Offline Multilingual Chatbot", page_icon="🛟")
+    st.set_page_config(page_title="Offline Multilingual Chatbot", page_icon="🛟", layout="wide")
+
+    # --- Custom CSS for chatbot look ---
+    st.markdown("""
+        <style>
+        .chat-container {
+            max-height: 500px;
+            overflow-y: auto;
+            padding: 1rem;
+            border-radius: 10px;
+            background-color: #f9f9f9;
+            margin-bottom: 1rem;
+        }
+        .user-msg {
+            background-color: #DCF8C6;
+            color: black;
+            padding: 10px 15px;
+            border-radius: 20px;
+            margin: 5px;
+            text-align: right;
+            display: inline-block;
+            max-width: 80%;
+        }
+        .bot-msg {
+            background-color: #E5E5EA;
+            color: black;
+            padding: 10px 15px;
+            border-radius: 20px;
+            margin: 5px;
+            text-align: left;
+            display: inline-block;
+            max-width: 80%;
+        }
+        .chat-row {
+            display: flex;
+            margin-bottom: 10px;
+        }
+        .chat-row.user { justify-content: flex-end; }
+        .chat-row.bot { justify-content: flex-start; }
+        .mic-button {
+            background: #007BFF;
+            color: white;
+            border-radius: 50%;
+            padding: 12px;
+            border: none;
+            cursor: pointer;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
     st.title("🛟 Offline Multilingual Disaster Chatbot")
-    st.caption("Speak or type in any language — input will be converted to English for processing.")
 
     if st.button("🔄 Rebuild Knowledge Base"):
         rebuild_kb()
@@ -156,30 +192,26 @@ def main():
     # 🎤 Mic recorder
     audio_bytes = st_audiorec()
 
-    # If mic audio exists, transcribe and store into session_state
     if audio_bytes is not None:
         try:
             recognized = transcribe_audio_bytes(audio_bytes)
             if recognized:
-                st.session_state["input_box"] = recognized
+                st.session_state["recognized_text"] = recognized
                 st.success(f"🗣️ Recognized (English): {recognized}")
         except Exception as e:
             st.error(f"Audio transcription failed: {e}")
 
-    # Text input (prefill with recognized speech if available)
+    # Text input
     user_text = st.text_input(
-        "Type or speak your question (English only after processing):",
-        value=st.session_state.get("input_box", ""),
-        key="input_box"
+        "Type or speak your question:",
+        value=st.session_state.get("recognized_text", ""),
+        key="input_text"
     )
 
     if "history" not in st.session_state:
         st.session_state.history = []
 
-    send_enabled = bool(user_text.strip())
-
-    if st.button("Send", disabled=not send_enabled):
-        lang = safe_detect(user_text)
+    if st.button("Send") and user_text.strip():
         query_en = translate(user_text, "en")
 
         answer_en = get_instant_reply(query_en)
@@ -197,18 +229,24 @@ def main():
             out = qa(prompt, max_new_tokens=64, do_sample=False)
             answer_en = out[0].get("generated_text", "").strip()
 
-        final_answer = answer_en  # ✅ keep answers in English only
+        st.session_state.history.append(("You", user_text, "user"))
+        st.session_state.history.append(("Bot", answer_en, "bot"))
 
-        st.session_state.history.append(("You", user_text, "en"))
-        st.session_state.history.append(("Bot", final_answer, "en"))
+        st.session_state["recognized_text"] = ""
+        st.rerun()
 
-        st.session_state["input_box"] = ""
-        st.experimental_rerun()
 
-    # Chat history
-    for speaker, text, lang in st.session_state.history[-20:]:
-        st.markdown(f"**{speaker} ({lang})**: {text}")
+    # --- Chat history container ---
+    st.markdown("<div class='chat-container'>", unsafe_allow_html=True)
+    for speaker, text, role in st.session_state.history[-20:]:
+        if role == "user":
+            st.markdown(f"<div class='chat-row user'><div class='user-msg'>{text}</div></div>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<div class='chat-row bot'><div class='bot-msg'>{text}</div></div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
     main()
+
+
