@@ -114,11 +114,10 @@ def transcribe_audio_bytes(audio_bytes: bytes) -> str:
         data = librosa.resample(data, orig_sr=samplerate, target_sr=16000)
 
     whisper_model = load_whisper()
-    result = whisper_model.transcribe(data, fp16=False, language="en")
+    result = whisper_model.transcribe(data, fp16=False)
 
     raw_text = result.get("text", "").strip()
-    english_text = translate(raw_text, "en")  # force English
-    return english_text
+    return raw_text  # don't force English here — let safe_detect handle language
 
 def rebuild_kb():
     os.makedirs(ART_DIR, exist_ok=True)
@@ -173,14 +172,6 @@ def main():
         }
         .chat-row.user { justify-content: flex-end; }
         .chat-row.bot { justify-content: flex-start; }
-        .mic-button {
-            background: #007BFF;
-            color: white;
-            border-radius: 50%;
-            padding: 12px;
-            border: none;
-            cursor: pointer;
-        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -191,13 +182,12 @@ def main():
 
     # 🎤 Mic recorder
     audio_bytes = st_audiorec()
-
     if audio_bytes is not None:
         try:
             recognized = transcribe_audio_bytes(audio_bytes)
             if recognized:
                 st.session_state["recognized_text"] = recognized
-                st.success(f"🗣️ Recognized (English): {recognized}")
+                st.success(f"🗣️ Recognized: {recognized}")
         except Exception as e:
             st.error(f"Audio transcription failed: {e}")
 
@@ -212,8 +202,13 @@ def main():
         st.session_state.history = []
 
     if st.button("Send") and user_text.strip():
+        # 1️⃣ Detect user language
+        user_lang = safe_detect(user_text)
+
+        # 2️⃣ Translate user input to English
         query_en = translate(user_text, "en")
 
+        # 3️⃣ Get answer in English
         answer_en = get_instant_reply(query_en)
         if not answer_en:
             embedder = load_embedder()
@@ -229,12 +224,18 @@ def main():
             out = qa(prompt, max_new_tokens=64, do_sample=False)
             answer_en = out[0].get("generated_text", "").strip()
 
+        # 4️⃣ Translate back to user's language if needed
+        if user_lang != "en":
+            answer_final = translate(answer_en, user_lang)
+        else:
+            answer_final = answer_en
+
+        # 5️⃣ Update chat history
         st.session_state.history.append(("You", user_text, "user"))
-        st.session_state.history.append(("Bot", answer_en, "bot"))
+        st.session_state.history.append(("Bot", answer_final, "bot"))
 
         st.session_state["recognized_text"] = ""
         st.rerun()
-
 
     # --- Chat history container ---
     st.markdown("<div class='chat-container'>", unsafe_allow_html=True)
