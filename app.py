@@ -23,7 +23,7 @@ INSTANT_REPLIES = {
     "hello": "Hello! I’m your offline assistant. Ask me anything.",
     "thanks": "You're welcome!",
     "thank you": "Glad to help!",
-    "who are you": "I’m your offline multilingual disaster chatbot, here to help.",
+    "who are you": "I’m your offline multilingual chatbot, here to help.",
     "how are you": "I’m running fine and ready to assist you.",
 }
 
@@ -175,7 +175,7 @@ def main():
         </style>
     """, unsafe_allow_html=True)
 
-    st.title("🛟 Offline Multilingual Disaster Chatbot")
+    st.title("🛟 Offline Multilingual Chatbot")
 
     if st.button("🔄 Rebuild Knowledge Base"):
         rebuild_kb()
