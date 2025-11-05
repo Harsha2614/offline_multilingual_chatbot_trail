@@ -4,12 +4,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import whisper
+import warnings
+import logging
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 from sentence_transformers import SentenceTransformer
-from st_audiorec import st_audiorec  # 🎤 mic recorder
-
+from st_audiorec import st_audiorec
 from utils import detect_lang, LANG_CODE_MAP, TRANSLATION_MODEL_ID
+
+warnings.filterwarnings("ignore", category=UserWarning)
+logging.getLogger("torch").setLevel(logging.ERROR)
 
 # ---------------- Paths ----------------
 ART_DIR = "artifacts"
@@ -23,11 +27,11 @@ INSTANT_REPLIES = {
     "hello": "Hello! I’m your offline assistant. Ask me anything.",
     "thanks": "You're welcome!",
     "thank you": "Glad to help!",
-    "who are you": "I’m your offline multilingual chatbot, here to help.",
+    "who are you": "I’m your offline multilingual disaster chatbot, here to help.",
     "how are you": "I’m running fine and ready to assist you.",
 }
 
-# ---------------- Cached loaders ----------------
+# ---------------- Cached Loaders ----------------
 @st.cache_resource
 def load_embedder():
     return SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
@@ -56,18 +60,13 @@ def load_whisper():
 
 # ---------------- Helpers ----------------
 def safe_detect(text: str) -> str:
-    t = (text or "").strip()
-    if not t:
+    if not text or len(text.strip()) < 2:
         return "en"
-    if len(t) < 5:
-        return "en"
-    detected = detect_lang(text)
-    if detected not in LANG_CODE_MAP:
-        return "en"
-    return detected
+    lang = detect_lang(text)
+    return lang if lang in LANG_CODE_MAP else "en"
 
 def get_instant_reply(text: str):
-    text_lower = (text or "").lower().strip()
+    text_lower = text.lower().strip()
     for key, val in INSTANT_REPLIES.items():
         if key in text_lower:
             return val
@@ -103,39 +102,55 @@ def cosine_search(embedder, kb_embeddings, df, query: str, k: int = 3):
     return results
 
 def transcribe_audio_bytes(audio_bytes: bytes) -> str:
-    """Convert mic audio to English text using Whisper (without ffmpeg)."""
     import soundfile as sf
     import librosa
-
     data, samplerate = sf.read(io.BytesIO(audio_bytes), dtype="float32")
     if data.ndim > 1:
         data = np.mean(data, axis=1)
     if samplerate != 16000:
         data = librosa.resample(data, orig_sr=samplerate, target_sr=16000)
+    result = load_whisper().transcribe(data, fp16=False)
+    return result.get("text", "").strip()
 
-    whisper_model = load_whisper()
-    result = whisper_model.transcribe(data, fp16=False)
-
-    raw_text = result.get("text", "").strip()
-    return raw_text  # don't force English here — let safe_detect handle language
-
-def rebuild_kb():
-    os.makedirs(ART_DIR, exist_ok=True)
-    df = pd.read_csv(KB_SOURCE)
-    texts = (df["question_en"].fillna("") + " " + df["answer_en"].fillna("")).tolist()
-    embedder = load_embedder()
-    embeddings = embedder.encode(
-        texts, batch_size=32, convert_to_numpy=True, normalize_embeddings=True
-    )
-    np.save(KB_EMB, embeddings)
-    df.to_csv(KB_CSV, index=False)
-    st.success("✅ Knowledge Base rebuilt successfully!")
-
-# ---------------- Main app ----------------
+# ---------------- Main ----------------
 def main():
-    st.set_page_config(page_title="Offline Multilingual Chatbot", page_icon="🛟", layout="wide")
+    st.set_page_config(page_title="Offline Multilingual Chatbot", page_icon="💬", layout="wide")
 
-    # --- Custom CSS for chatbot look ---
+    # Session states
+    if "chat_open" not in st.session_state:
+        st.session_state.chat_open = False
+    if "history" not in st.session_state:
+        st.session_state.history = []
+
+    # --- Floating Button ---
+    st.markdown("""
+        <style>
+        .chat-btn {
+            position: fixed;
+            bottom: 25px;
+            right: 25px;
+            background-color: #0084FF;
+            color: white;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            font-size: 28px;
+            cursor: pointer;
+            z-index: 9999;
+            border: none;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    # Show floating button always
+    if not st.session_state.chat_open:
+        if st.button("💬", key="open_chat", help="Open chatbot"):
+            st.session_state.chat_open = True
+            st.rerun()
+        return
+
+    # --- Chat UI ---
     st.markdown("""
         <style>
         .chat-container {
@@ -148,102 +163,76 @@ def main():
         }
         .user-msg {
             background-color: #DCF8C6;
-            color: black;
-            padding: 10px 15px;
-            border-radius: 20px;
+            padding: 8px 12px;
+            border-radius: 18px;
             margin: 5px;
             text-align: right;
-            display: inline-block;
-            max-width: 80%;
         }
         .bot-msg {
             background-color: #E5E5EA;
-            color: black;
-            padding: 10px 15px;
-            border-radius: 20px;
+            padding: 8px 12px;
+            border-radius: 18px;
             margin: 5px;
             text-align: left;
-            display: inline-block;
-            max-width: 80%;
         }
-        .chat-row {
-            display: flex;
-            margin-bottom: 10px;
-        }
-        .chat-row.user { justify-content: flex-end; }
-        .chat-row.bot { justify-content: flex-start; }
         </style>
     """, unsafe_allow_html=True)
 
-    st.title("🛟 Offline Multilingual Chatbot")
+    st.title("💬 Offline Multilingual Chatbot")
 
-    if st.button("🔄 Rebuild Knowledge Base"):
-        rebuild_kb()
+    if st.button("❌ Close Chat"):
+        st.session_state.chat_open = False
+        st.rerun()
 
-    # 🎤 Mic recorder
     audio_bytes = st_audiorec()
-    if audio_bytes is not None:
+    if audio_bytes:
         try:
             recognized = transcribe_audio_bytes(audio_bytes)
             if recognized:
                 st.session_state["recognized_text"] = recognized
-                st.success(f"🗣️ Recognized: {recognized}")
+                st.success(f"🎙 Recognized: {recognized}")
         except Exception as e:
-            st.error(f"Audio transcription failed: {e}")
+            st.error(f"Audio error: {e}")
 
-    # Text input
     user_text = st.text_input(
         "Type or speak your question:",
         value=st.session_state.get("recognized_text", ""),
         key="input_text"
     )
 
-    if "history" not in st.session_state:
+    if st.button("🗑 Clear Chat"):
         st.session_state.history = []
+        st.session_state["recognized_text"] = ""
+        st.rerun()
 
     if st.button("Send") and user_text.strip():
-        # 1️⃣ Detect user language
-        user_lang = safe_detect(user_text)
-
-        # 2️⃣ Translate user input to English
+        lang = safe_detect(user_text)
         query_en = translate(user_text, "en")
 
-        # 3️⃣ Get answer in English
         answer_en = get_instant_reply(query_en)
         if not answer_en:
-            embedder = load_embedder()
             df, kb_embeddings = load_kb()
             if df is not None and kb_embeddings is not None:
-                results = cosine_search(embedder, kb_embeddings, df, query_en, k=3)
+                results = cosine_search(load_embedder(), kb_embeddings, df, query_en)
                 if results and results[0]["score"] > 0.55:
                     answer_en = results[0]["answer_en"]
 
         if not answer_en:
             qa = load_general_qa()
-            prompt = f"Answer concisely and helpfully:\n\n{query_en}"
-            out = qa(prompt, max_new_tokens=64, do_sample=False)
-            answer_en = out[0].get("generated_text", "").strip()
+            out = qa(f"Answer briefly:\n{query_en}", max_new_tokens=64, do_sample=False)
+            answer_en = out[0]["generated_text"]
 
-        # 4️⃣ Translate back to user's language if needed
-        if user_lang != "en":
-            answer_final = translate(answer_en, user_lang)
-        else:
-            answer_final = answer_en
-
-        # 5️⃣ Update chat history
+        final_answer = translate(answer_en, lang)
         st.session_state.history.append(("You", user_text, "user"))
-        st.session_state.history.append(("Bot", answer_final, "bot"))
-
+        st.session_state.history.append(("Bot", final_answer, "bot"))
         st.session_state["recognized_text"] = ""
         st.rerun()
 
-    # --- Chat history container ---
+    # --- Chat Display ---
     st.markdown("<div class='chat-container'>", unsafe_allow_html=True)
-    for speaker, text, role in st.session_state.history[-20:]:
-        if role == "user":
-            st.markdown(f"<div class='chat-row user'><div class='user-msg'>{text}</div></div>", unsafe_allow_html=True)
-        else:
-            st.markdown(f"<div class='chat-row bot'><div class='bot-msg'>{text}</div></div>", unsafe_allow_html=True)
+    for sender, msg, role in st.session_state.history[-20:]:
+        style = "user-msg" if role == "user" else "bot-msg"
+        st.markdown(f"<div class='{style}'>{msg}</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
