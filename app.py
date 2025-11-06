@@ -8,6 +8,7 @@ import streamlit as st
 import whisper
 import warnings
 import logging
+import streamlit.runtime.scriptrunner as scriptrunner
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 from sentence_transformers import SentenceTransformer
@@ -19,10 +20,10 @@ logging.getLogger("torch").setLevel(logging.ERROR)
 
 # ---------------- Paths ----------------
 ART_DIR = "artifacts"
-KB_SOURCE = "knowledge_base.csv"
+META_FILE = os.path.join(ART_DIR, "kb_meta.txt")
 KB_CSV = os.path.join(ART_DIR, "kb_rows.csv")
 KB_EMB = os.path.join(ART_DIR, "kb_embeddings.npy")
-META_FILE = os.path.join(ART_DIR, "kb_meta.txt")
+KB_SOURCE = "knowledge_base.csv"
 
 # ---------------- Cached Loaders ----------------
 @st.cache_resource
@@ -49,7 +50,8 @@ def load_general_qa():
 
 @st.cache_resource
 def load_whisper():
-    return whisper.load_model("base")
+    # Medium model for higher accuracy in Telugu and Hindi
+    return whisper.load_model("medium")
 
 # ---------------- Helper Functions ----------------
 def safe_detect(text: str) -> str:
@@ -71,7 +73,8 @@ def translate(text: str, target_lang: str = "en") -> str:
     generated = model.generate(**encoded, forced_bos_token_id=forced_bos_token_id, max_length=256)
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
-def transcribe_audio_bytes(audio_bytes: bytes) -> str:
+def transcribe_audio_bytes(audio_bytes: bytes) -> tuple:
+    """Automatically detect and transcribe speech (Telugu/English/Hindi)."""
     import soundfile as sf
     import librosa
     data, samplerate = sf.read(io.BytesIO(audio_bytes), dtype="float32")
@@ -79,12 +82,13 @@ def transcribe_audio_bytes(audio_bytes: bytes) -> str:
         data = np.mean(data, axis=1)
     if samplerate != 16000:
         data = librosa.resample(data, orig_sr=samplerate, target_sr=16000)
-    result = load_whisper().transcribe(data, fp16=False)
-    return result.get("text", "").strip()
+    model = load_whisper()
+    result = model.transcribe(data, fp16=False, language=None)
+    detected_lang = result.get("language", "unknown")
+    text = result.get("text", "").strip()
+    return detected_lang, text
 
-# ---------------- KB Management ----------------
 def preprocess_query(text: str) -> str:
-    """Normalize user query before embedding."""
     text = text.lower()
     text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
     return text.strip()
@@ -98,58 +102,55 @@ def cosine_search(embedder, kb_embeddings, df, query: str, k: int = 3):
         return None
     best_idx = topk_idx[0]
     score = sims[best_idx]
-    if score < 0.45:  # soft threshold
+    if score < 0.55:
         return None
     row = df.iloc[best_idx]
     return {"id": row["id"], "score": float(score), "answer_en": row["answer_en"]}
 
 def rebuild_kb():
-    """Rebuilds bilingual knowledge base embeddings."""
+    """Rebuild bilingual knowledge base embeddings."""
     st.info("🔄 Rebuilding Knowledge Base... please wait.")
     try:
         os.makedirs(ART_DIR, exist_ok=True)
         df = pd.read_csv(KB_SOURCE)
-
         required_cols = {"id", "question_en", "answer_en", "question_te", "answer_te"}
         if not required_cols.issubset(df.columns):
             st.error("❌ 'knowledge_base.csv' must include: id, question_en, answer_en, question_te, answer_te")
             return
-
         embedder = load_embedder()
         bilingual_texts = (
             df["question_en"].fillna("") + " " + df["answer_en"].fillna("") + " " +
             df["question_te"].fillna("") + " " + df["answer_te"].fillna("")
         ).tolist()
-
         progress_bar = st.progress(0)
         embeddings = []
         for i, t in enumerate(bilingual_texts):
             emb = embedder.encode(t, convert_to_numpy=True, normalize_embeddings=True)
             embeddings.append(emb)
             progress_bar.progress((i + 1) / len(bilingual_texts))
-
         embeddings = np.array(embeddings)
         np.save(KB_EMB, embeddings)
         df.to_csv(KB_CSV, index=False)
-
         with open(META_FILE, "w") as f:
             f.write(f"Last rebuilt: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Total entries: {len(df)}")
-
         st.success(f"✅ Bilingual knowledge base rebuilt successfully with {len(df)} entries!")
-        st.session_state["kb_last_rebuilt"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.session_state["kb_entries"] = len(df)
         st.balloons()
-
     except Exception as e:
         if "RerunData" not in str(e):
             st.error(f"⚠️ Error rebuilding KB: {e}")
 
-# ---------------- Chatbot UI ----------------
+# ---------------- Main ----------------
 def main():
     st.set_page_config(page_title="Offline Multilingual Chatbot", page_icon="💬", layout="wide")
 
-    # --- Custom CSS (UI styling) ---
+    # Session states
+    if "chat_open" not in st.session_state:
+        st.session_state.chat_open = False
+    if "history" not in st.session_state:
+        st.session_state.history = []
+
+    # --- Custom CSS ---
     st.markdown("""
         <style>
         .chat-btn {
@@ -169,7 +170,6 @@ def main():
             transition: transform 0.2s ease-in-out;
         }
         .chat-btn:hover { transform: scale(1.1); }
-
         .chat-container {
             max-height: 500px;
             overflow-y: auto;
@@ -177,7 +177,6 @@ def main():
             border-radius: 10px;
             background-color: #f9f9f9;
             margin-bottom: 1rem;
-            animation: slideUp 0.5s ease-out;
         }
         .user-msg {
             background-color: #DCF8C6;
@@ -187,9 +186,7 @@ def main():
             display: inline-block;
             max-width: 70%;
             word-wrap: break-word;
-            text-align: left;
             align-self: flex-end;
-            animation: fadeIn 0.3s ease-in-out;
         }
         .bot-msg {
             background-color: #E5E5EA;
@@ -199,48 +196,54 @@ def main():
             display: inline-block;
             max-width: 70%;
             word-wrap: break-word;
-            text-align: left;
             align-self: flex-start;
-            animation: fadeIn 0.3s ease-in-out;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
         }
         </style>
     """, unsafe_allow_html=True)
 
-    if "history" not in st.session_state:
-        st.session_state.history = []
+    # --- Floating Button ---
+    if not st.session_state.chat_open:
+        if st.button("💬", key="open_chat", help="Open chatbot"):
+            st.session_state.chat_open = True
+            st.rerun()
+        return
 
+    # --- Chat Interface ---
     st.title("💬 Offline Multilingual Chatbot")
 
-    # --- KB Management Section ---
-    st.subheader("🗂 Knowledge Base Management")
+    if st.button("❌ Close Chat"):
+        st.session_state.chat_open = False
+        st.rerun()
+
+    # --- KB Management ---
+    st.subheader("📚 Knowledge Base Management")
     if st.button("🔄 Rebuild Knowledge Base"):
         rebuild_kb()
 
     if os.path.exists(META_FILE):
         with open(META_FILE) as f:
             st.caption(f.read())
-    if "kb_last_rebuilt" in st.session_state:
-        st.caption(f"🕒 Last rebuilt (session): {st.session_state['kb_last_rebuilt']} | Entries: {st.session_state.get('kb_entries', '?')}")
 
     st.divider()
 
-    # --- Voice input ---
+    # --- Voice Input ---
     audio_bytes = st_audiorec()
     if audio_bytes:
         try:
-            recognized = transcribe_audio_bytes(audio_bytes)
+            detected_lang, recognized = transcribe_audio_bytes(audio_bytes)
             if recognized:
                 st.session_state["recognized_text"] = recognized
-                st.success(f"🎙 Recognized: {recognized}")
+                st.info(f"🎧 Detected Language: {detected_lang.upper()}")
+                st.success(f"🎙 Recognized Text: {recognized}")
         except Exception as e:
             st.error(f"Audio error: {e}")
 
-    # --- Text input ---
-    user_text = st.text_input("Type or speak your question:", value=st.session_state.get("recognized_text", ""), key="input_text")
+    # --- Text Input ---
+    user_text = st.text_input(
+        "Type or speak your question:",
+        value=st.session_state.get("recognized_text", ""),
+        key="input_text"
+    )
 
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -256,17 +259,14 @@ def main():
         query_en = translate(user_text, "en")
         df, kb_embeddings = load_kb()
         answer_en = None
-
         if df is not None and kb_embeddings is not None:
             result = cosine_search(load_embedder(), kb_embeddings, df, query_en)
             if result:
                 answer_en = result["answer_en"]
-
         if not answer_en:
             qa = load_general_qa()
             out = qa(f"Answer briefly:\n{query_en}", max_new_tokens=64, do_sample=False)
             answer_en = out[0]["generated_text"]
-
         final_answer = translate(answer_en, lang)
         st.session_state.history.append(("You", user_text, "user"))
         st.session_state.history.append(("Bot", final_answer, "bot"))
@@ -274,11 +274,10 @@ def main():
         st.rerun()
 
     # --- Chat Display ---
-    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
     for sender, msg, role in st.session_state.history[-20:]:
         style = "user-msg" if role == "user" else "bot-msg"
         st.markdown(f"<div class='{style}'>{msg}</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
 
+# ---------------- Run ----------------
 if __name__ == "__main__":
     main()
