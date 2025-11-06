@@ -1,5 +1,7 @@
 import os
 import io
+import re
+import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -17,19 +19,10 @@ logging.getLogger("torch").setLevel(logging.ERROR)
 
 # ---------------- Paths ----------------
 ART_DIR = "artifacts"
+KB_SOURCE = "knowledge_base.csv"
 KB_CSV = os.path.join(ART_DIR, "kb_rows.csv")
 KB_EMB = os.path.join(ART_DIR, "kb_embeddings.npy")
-KB_SOURCE = "knowledge_base.csv"
-
-# ---------------- Instant replies ----------------
-INSTANT_REPLIES = {
-    "hi": "Hello! How can I help you today?",
-    "hello": "Hello! I’m your offline assistant. Ask me anything.",
-    "thanks": "You're welcome!",
-    "thank you": "Glad to help!",
-    "who are you": "I’m your offline multilingual disaster chatbot, here to help.",
-    "how are you": "I’m running fine and ready to assist you.",
-}
+META_FILE = os.path.join(ART_DIR, "kb_meta.txt")
 
 # ---------------- Cached Loaders ----------------
 @st.cache_resource
@@ -58,19 +51,12 @@ def load_general_qa():
 def load_whisper():
     return whisper.load_model("base")
 
-# ---------------- Helpers ----------------
+# ---------------- Helper Functions ----------------
 def safe_detect(text: str) -> str:
     if not text or len(text.strip()) < 2:
         return "en"
     lang = detect_lang(text)
     return lang if lang in LANG_CODE_MAP else "en"
-
-def get_instant_reply(text: str):
-    text_lower = text.lower().strip()
-    for key, val in INSTANT_REPLIES.items():
-        if key in text_lower:
-            return val
-    return None
 
 def translate(text: str, target_lang: str = "en") -> str:
     tokenizer, model = load_translator()
@@ -82,24 +68,8 @@ def translate(text: str, target_lang: str = "en") -> str:
     tokenizer.src_lang = src_lang
     encoded = tokenizer(text, return_tensors="pt")
     forced_bos_token_id = tokenizer.convert_tokens_to_ids(tgt_lang)
-    generated = model.generate(
-        **encoded,
-        forced_bos_token_id=forced_bos_token_id,
-        max_length=256,
-        do_sample=False,
-        num_beams=2,
-    )
+    generated = model.generate(**encoded, forced_bos_token_id=forced_bos_token_id, max_length=256)
     return tokenizer.decode(generated[0], skip_special_tokens=True)
-
-def cosine_search(embedder, kb_embeddings, df, query: str, k: int = 3):
-    q_emb = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True)
-    sims = np.dot(kb_embeddings, q_emb.T).flatten()
-    topk_idx = sims.argsort()[::-1][:k]
-    results = []
-    for i in topk_idx:
-        row = df.iloc[i]
-        results.append({"id": row["id"], "score": float(sims[i]), "answer_en": row["answer_en"]})
-    return results
 
 def transcribe_audio_bytes(audio_bytes: bytes) -> str:
     import soundfile as sf
@@ -112,17 +82,74 @@ def transcribe_audio_bytes(audio_bytes: bytes) -> str:
     result = load_whisper().transcribe(data, fp16=False)
     return result.get("text", "").strip()
 
-# ---------------- Main ----------------
+# ---------------- KB Management ----------------
+def preprocess_query(text: str) -> str:
+    """Normalize user query before embedding."""
+    text = text.lower()
+    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
+    return text.strip()
+
+def cosine_search(embedder, kb_embeddings, df, query: str, k: int = 3):
+    query = preprocess_query(query)
+    q_emb = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True)
+    sims = np.dot(kb_embeddings, q_emb.T).flatten()
+    topk_idx = sims.argsort()[::-1][:k]
+    if len(topk_idx) == 0:
+        return None
+    best_idx = topk_idx[0]
+    score = sims[best_idx]
+    if score < 0.45:  # soft threshold
+        return None
+    row = df.iloc[best_idx]
+    return {"id": row["id"], "score": float(score), "answer_en": row["answer_en"]}
+
+def rebuild_kb():
+    """Rebuilds bilingual knowledge base embeddings."""
+    st.info("🔄 Rebuilding Knowledge Base... please wait.")
+    try:
+        os.makedirs(ART_DIR, exist_ok=True)
+        df = pd.read_csv(KB_SOURCE)
+
+        required_cols = {"id", "question_en", "answer_en", "question_te", "answer_te"}
+        if not required_cols.issubset(df.columns):
+            st.error("❌ 'knowledge_base.csv' must include: id, question_en, answer_en, question_te, answer_te")
+            return
+
+        embedder = load_embedder()
+        bilingual_texts = (
+            df["question_en"].fillna("") + " " + df["answer_en"].fillna("") + " " +
+            df["question_te"].fillna("") + " " + df["answer_te"].fillna("")
+        ).tolist()
+
+        progress_bar = st.progress(0)
+        embeddings = []
+        for i, t in enumerate(bilingual_texts):
+            emb = embedder.encode(t, convert_to_numpy=True, normalize_embeddings=True)
+            embeddings.append(emb)
+            progress_bar.progress((i + 1) / len(bilingual_texts))
+
+        embeddings = np.array(embeddings)
+        np.save(KB_EMB, embeddings)
+        df.to_csv(KB_CSV, index=False)
+
+        with open(META_FILE, "w") as f:
+            f.write(f"Last rebuilt: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total entries: {len(df)}")
+
+        st.success(f"✅ Bilingual knowledge base rebuilt successfully with {len(df)} entries!")
+        st.session_state["kb_last_rebuilt"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.session_state["kb_entries"] = len(df)
+        st.balloons()
+
+    except Exception as e:
+        if "RerunData" not in str(e):
+            st.error(f"⚠️ Error rebuilding KB: {e}")
+
+# ---------------- Chatbot UI ----------------
 def main():
     st.set_page_config(page_title="Offline Multilingual Chatbot", page_icon="💬", layout="wide")
 
-    # Session states
-    if "chat_open" not in st.session_state:
-        st.session_state.chat_open = False
-    if "history" not in st.session_state:
-        st.session_state.history = []
-
-    # --- Floating Button ---
+    # --- Custom CSS (UI styling) ---
     st.markdown("""
         <style>
         .chat-btn {
@@ -139,20 +166,10 @@ def main():
             z-index: 9999;
             border: none;
             box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+            transition: transform 0.2s ease-in-out;
         }
-        </style>
-    """, unsafe_allow_html=True)
+        .chat-btn:hover { transform: scale(1.1); }
 
-    # Show floating button always
-    if not st.session_state.chat_open:
-        if st.button("💬", key="open_chat", help="Open chatbot"):
-            st.session_state.chat_open = True
-            st.rerun()
-        return
-
-    # --- Chat UI ---
-    st.markdown("""
-        <style>
         .chat-container {
             max-height: 500px;
             overflow-y: auto;
@@ -160,30 +177,58 @@ def main():
             border-radius: 10px;
             background-color: #f9f9f9;
             margin-bottom: 1rem;
+            animation: slideUp 0.5s ease-out;
         }
         .user-msg {
             background-color: #DCF8C6;
-            padding: 8px 12px;
-            border-radius: 18px;
+            padding: 10px 14px;
+            border-radius: 18px 18px 0 18px;
             margin: 5px;
-            text-align: right;
+            display: inline-block;
+            max-width: 70%;
+            word-wrap: break-word;
+            text-align: left;
+            align-self: flex-end;
+            animation: fadeIn 0.3s ease-in-out;
         }
         .bot-msg {
             background-color: #E5E5EA;
-            padding: 8px 12px;
-            border-radius: 18px;
+            padding: 10px 14px;
+            border-radius: 18px 18px 18px 0;
             margin: 5px;
+            display: inline-block;
+            max-width: 70%;
+            word-wrap: break-word;
             text-align: left;
+            align-self: flex-start;
+            animation: fadeIn 0.3s ease-in-out;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
         }
         </style>
     """, unsafe_allow_html=True)
 
+    if "history" not in st.session_state:
+        st.session_state.history = []
+
     st.title("💬 Offline Multilingual Chatbot")
 
-    if st.button("❌ Close Chat"):
-        st.session_state.chat_open = False
-        st.rerun()
+    # --- KB Management Section ---
+    st.subheader("🗂 Knowledge Base Management")
+    if st.button("🔄 Rebuild Knowledge Base"):
+        rebuild_kb()
 
+    if os.path.exists(META_FILE):
+        with open(META_FILE) as f:
+            st.caption(f.read())
+    if "kb_last_rebuilt" in st.session_state:
+        st.caption(f"🕒 Last rebuilt (session): {st.session_state['kb_last_rebuilt']} | Entries: {st.session_state.get('kb_entries', '?')}")
+
+    st.divider()
+
+    # --- Voice input ---
     audio_bytes = st_audiorec()
     if audio_bytes:
         try:
@@ -194,28 +239,28 @@ def main():
         except Exception as e:
             st.error(f"Audio error: {e}")
 
-    user_text = st.text_input(
-        "Type or speak your question:",
-        value=st.session_state.get("recognized_text", ""),
-        key="input_text"
-    )
+    # --- Text input ---
+    user_text = st.text_input("Type or speak your question:", value=st.session_state.get("recognized_text", ""), key="input_text")
 
-    if st.button("🗑 Clear Chat"):
-        st.session_state.history = []
-        st.session_state["recognized_text"] = ""
-        st.rerun()
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("🗑 Clear Chat"):
+            st.session_state.history = []
+            st.session_state["recognized_text"] = ""
+            st.rerun()
+    with col2:
+        send_pressed = st.button("📤 Send")
 
-    if st.button("Send") and user_text.strip():
+    if send_pressed and user_text.strip():
         lang = safe_detect(user_text)
         query_en = translate(user_text, "en")
+        df, kb_embeddings = load_kb()
+        answer_en = None
 
-        answer_en = get_instant_reply(query_en)
-        if not answer_en:
-            df, kb_embeddings = load_kb()
-            if df is not None and kb_embeddings is not None:
-                results = cosine_search(load_embedder(), kb_embeddings, df, query_en)
-                if results and results[0]["score"] > 0.55:
-                    answer_en = results[0]["answer_en"]
+        if df is not None and kb_embeddings is not None:
+            result = cosine_search(load_embedder(), kb_embeddings, df, query_en)
+            if result:
+                answer_en = result["answer_en"]
 
         if not answer_en:
             qa = load_general_qa()
@@ -229,12 +274,11 @@ def main():
         st.rerun()
 
     # --- Chat Display ---
-    st.markdown("<div class='chat-container'>", unsafe_allow_html=True)
+    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
     for sender, msg, role in st.session_state.history[-20:]:
         style = "user-msg" if role == "user" else "bot-msg"
         st.markdown(f"<div class='{style}'>{msg}</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
-
 
 if __name__ == "__main__":
     main()
